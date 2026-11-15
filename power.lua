@@ -14,37 +14,50 @@ local networks = {}
 local postonetwork = {}
 --the nodes in each network above
 local networknodes = {}
---the next index added to in networks
+--supply of each node
+local nodesupply = {}
+--demand of each node
+local nodedemand =  {}
+--next index added to network
 local nextnetworkid = 0
 --saves the networks to mod storage, runs on shutdown or on-command
 local function save_networks()
-    storage:set_string("networks", core.serialize(networks))
-    storage:set_int("nextnetworkid", nextnetworkid)
+    local metadata = {}
+    metadata.fields = {}
+    
+    metadata.fields["networks"] = core.serialize(networks)
+    metadata.fields["nextnetworkid"] = nextnetworkid
+
+    metadata.fields["nodesupply"] = core.serialize(nodesupply)
+    metadata.fields["nodedemand"] = core.serialize(nodedemand)
 
     for netid, nodes in pairs(networknodes) do
-        storage:set_string(
-            "networknodes_" .. netid,
-            core.serialize(nodes)
-        )
+        metadata.fields["networknodes_" .. netid] = core.serialize(nodes)
     end
+
+    storage:from_table(metadata)
 end
 
 --loads networks from mod storage
 local function load_networks()
-    local saved = storage:get_string("networks")
 
-    if saved == "" then return end
+    local metadata = storage:to_table()
+    local saved = metadata.fields.networks
+
+    if not saved or saved == "" then return end
 
     networks = core.deserialize(saved) or {}
-    nextnetworkid = storage:get_int("nextnetworkid")
-
+    nextnetworkid = tonumber(metadata.fields.nextnetworkid) or 0
     networknodes = {}
     postonetwork = {}
 
+    nodesupply = core.deserialize(metadata.fields.nodesupply or "") or {}
+    nodedemand = core.deserialize(metadata.fields.nodedemand or "") or {}
+
     for netid in pairs(networks) do
-        local nodes_saved = storage:get_string(
-            "networknodes_" .. netid
-        )
+
+
+        local nodes_saved = metadata.fields["networknodes_" .. netid]
 
         local nodes = core.deserialize(nodes_saved) or {}
         networknodes[netid] = nodes
@@ -54,9 +67,35 @@ local function load_networks()
         end
     end
 end
+
+--edits the supply/demand of the network
+function unnamed_tech_mod.add_power(netid, supply, demand)
+    local net = networks[netid]
+    if not net then return end
+    net.supply = net.supply + (supply or 0)
+    net.demand = net.demand + (demand or 0)
+end
+
+--sets the power of a node (hash is what is obtained when doing core.hash_node_position())
+function unnamed_tech_mod.set_node_power(hash, new_supply, new_demand)
+
+    local old_supply = nodesupply[hash] or 0
+    local old_demand = nodedemand[hash] or 0
+
+    new_supply = new_supply or old_supply
+    new_demand = new_demand or old_demand
+
+    nodesupply[hash] = new_supply
+    nodedemand[hash] = new_demand
+
+    local netid = postonetwork[hash]
+
+    if netid then
+        unnamed_tech_mod.add_power(netid, new_supply - old_supply, new_demand - old_demand)
+    end
+end
+
 --6 directions to check, for get_adjecent_networks
-
-
 local dirs = {
     {x =  1, y =  0, z =  0},
     {x = -1, y =  0, z =  0},
@@ -120,35 +159,7 @@ local function merge_networks(net1id, net2id)
     networks[net2id] = nil
     networknodes[net2id] = nil
 end
---adds a node to the network
-function unnamed_tech_mod.add_node(pos, type, supply, demand)
-    local hash = core.hash_node_position(pos)
-    --if there is already a connection
-    if postonetwork[hash] then return postonetwork[hash] end 
 
-    supply = supply or 0
-    demand = demand or 0
-
-    local adjacent = get_adjacent_networks(pos, type)
-    local netid
-    --create new network if here is none adjacent of the required type
-    if #adjacent == 0 then
-        netid = create_network(type)
-    else
-        netid = adjacent[1]
-        for i = 2, #adjacent do
-            merge_networks(netid, adjacent[i])
-        end
-    end
-
-    postonetwork[hash] = netid
-    networknodes[netid][hash] = true
-
-    networks[netid].supply = networks[netid].supply + supply
-    networks[netid].demand = networks[netid].demand + demand
-
-    return netid
-end
 --gets connected components
 local function get_connected_component(start_hash, target_netid, visited)
     local component = {}
@@ -176,28 +187,24 @@ local function get_connected_component(start_hash, target_netid, visited)
     return component
 end
 
---called when a networks connection to the network is changed
-local function notify_network_change(pos, netid)
-    local node = core.get_node_or_nil(pos)
-    if not node then return end
-
-    local def = core.registered_nodes[node.name]
-    if def and def._on_network_change then
-        def._on_network_change(pos, netid)
-    end
-end
 --removes the node from the network
-function unnamed_tech_mod.remove_node(pos, supply, demand)
+function unnamed_tech_mod.remove_node(pos)
+
     local hash = core.hash_node_position(pos)
     local netid = postonetwork[hash]
+    --the network was a figment of our imaginatiom
     if not netid then return end
 
-    supply = supply or 0
-    demand = demand or 0
+    local supply = nodesupply[hash] or 0
+    local demand = nodedemand[hash] or 0
+
+    nodesupply[hash] = nil
+    nodedemand[hash] = nil
 
     local net = networks[netid]
 
     postonetwork[hash] = nil
+
     if networknodes[netid] then
         networknodes[netid][hash] = nil
     end
@@ -205,6 +212,7 @@ function unnamed_tech_mod.remove_node(pos, supply, demand)
     if not net then return end
 
     local same_net_neighbors = {}
+    --gets number of neighbors from the same network
     for _, dir in ipairs(dirs) do
         local adj_pos = vector.add(pos, dir)
         local adj_hash = core.hash_node_position(adj_pos)
@@ -212,13 +220,13 @@ function unnamed_tech_mod.remove_node(pos, supply, demand)
             same_net_neighbors[#same_net_neighbors + 1] = adj_hash
         end
     end
-
+    --none means it was the only one there
     if #same_net_neighbors == 0 then
         networks[netid] = nil
         networknodes[netid] = nil
         return
     end
-
+    --one means it was at the end
     if #same_net_neighbors == 1 then
         net.supply = net.supply - supply
         net.demand = net.demand - demand
@@ -246,24 +254,48 @@ function unnamed_tech_mod.remove_node(pos, supply, demand)
 
     for _, component in ipairs(components) do
         local new_id = create_network(old_type)
+        local new_net = networks[new_id]
         local new_nodes = networknodes[new_id]
 
         for _, node_hash in ipairs(component) do
             postonetwork[node_hash] = new_id
             new_nodes[node_hash] = true
 
-            local node_pos = core.get_position_from_hash(node_hash)
-            notify_network_change(node_pos, new_id)
+            new_net.supply = new_net.supply + (nodesupply[node_hash] or 0)
+            new_net.demand = new_net.demand + (nodedemand[node_hash] or 0)
         end
     end
 end
---edits the supply/demand of the network
-function unnamed_tech_mod.add_power(netid, supply, demand)
-    local net = networks[netid]
-    if not net then return end
-    net.supply = net.supply + (supply or 0)
-    net.demand = net.demand + (demand or 0)
+
+--adds a node to the network
+function unnamed_tech_mod.add_node(pos, type, supply, demand)
+    local hash = core.hash_node_position(pos)
+    --if there is already a connection
+    if postonetwork[hash] then return postonetwork[hash] end 
+
+    local supply = supply or 0
+    local demand = demand or 0
+
+    local adjacent = get_adjacent_networks(pos, type)
+    local netid
+    --create new network if here is none adjacent of the required type
+    if #adjacent == 0 then
+        netid = create_network(type)
+    else
+        netid = adjacent[1]
+        for i = 2, #adjacent do
+            merge_networks(netid, adjacent[i])
+        end
+    end
+
+    postonetwork[hash] = netid
+    networknodes[netid][hash] = true
+    --power use
+    unnamed_tech_mod.set_node_power(hash, supply, demand)
+    return netid
 end
+
+
 
 function unnamed_tech_mod.get_network_at(pos)
     local hash = core.hash_node_position(pos)
@@ -309,44 +341,16 @@ function unnamed_tech_mod.register_power_node(name, def)
     def.groups["machine_" .. def.net_type] = 1
 
     def.on_construct = function(pos)
-        local meta = core.get_meta(pos)
-        if base_supply > 0 then meta:set_int("supply", base_supply) end
-        if base_demand > 0 then meta:set_int("demand", base_demand) end
-
         unnamed_tech_mod.add_node(pos, def.net_type, base_supply, base_demand)
         return on_construct and on_construct(pos) or nil
     end
 
     def.on_destruct = function(pos)
-        local meta = core.get_meta(pos)
-        unnamed_tech_mod.remove_node(pos, meta:get_int("supply"), meta:get_int("demand"))
+        unnamed_tech_mod.remove_node(pos)
         return on_destruct and on_destruct(pos) or nil
-    end
-    if not is_cable then
-        def._on_network_change = def._on_network_change or function(pos, new_netid)
-            local meta = core.get_meta(pos)
-            unnamed_tech_mod.add_power(new_netid, meta:get_int("supply"), meta:get_int("demand"))
-        end
     end
 
     core.register_node(name, def)
-end
-
-function unnamed_tech_mod.set_node_power(pos, new_supply, new_demand)
-    local meta = core.get_meta(pos)
-    local old_supply = meta:get_int("supply")
-    local old_demand = meta:get_int("demand")
-
-    new_supply = new_supply or old_supply
-    new_demand = new_demand or old_demand
-
-    meta:set_int("supply", new_supply)
-    meta:set_int("demand", new_demand)
-
-    local netid = postonetwork[core.hash_node_position(pos)]
-    if netid then
-        unnamed_tech_mod.add_power(netid, new_supply - old_supply, new_demand - old_demand)
-    end
 end
 --run a modified network save over time
 local time = 0
