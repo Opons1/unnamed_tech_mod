@@ -28,6 +28,9 @@ local function allow_metadata_inventory_move(pos, from_list, from_index, to_list
     if core.is_protected(pos, player:get_name()) then
         return 0
     end
+    if to_list == "dst" then
+        return 0
+    end
     return count
 end
 
@@ -83,6 +86,8 @@ end
 function unnamed_tech_mod.register_basic_machine(name, data)
     local recipe_type = data.recipe_type
     data.recipe_type = nil
+    local demand = data.demand or 100
+    data.demand = nil
 
     local recipedata = unnamed_tech_mod.recipe_types[recipe_type]
     local input_slots = recipedata.input_slots
@@ -99,6 +104,10 @@ function unnamed_tech_mod.register_basic_machine(name, data)
         timer:start(4)
     end
 
+    data.on_timer = function(pos)
+        
+    end
+
     --protection stuff
     data.allow_metadata_inventory_put = allow_metadata_inventory_put
     data.allow_metadata_inventory_take = allow_metadata_inventory_take
@@ -107,6 +116,8 @@ function unnamed_tech_mod.register_basic_machine(name, data)
     --notify changes to make the machine check more often
     data.on_metadata_inventory_put = on_metadata_inventory_put
     data.on_metadata_inventory_take = on_metadata_inventory_take
+
+
 
 
 
