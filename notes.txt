@@ -1,0 +1,495 @@
+# Network system redesign – implementation specification
+
+The goal is to redesign the power network system to be more efficient, scalable, and maintainable, particularly when it comes to saving data.
+
+The most important design priority is fast saving, even at the expense of slower loading. The system should avoid repeatedly serializing large tables when only a handful of nodes have changed.
+
+This document describes the intended architecture, responsibilities, data structures, and implementation order. It is intended to be used as a development checklist.
+
+# 1. Core architectural principles
+
+The new system should follow these principles:
+
+1. Persistent data and runtime data must be separate.
+2. Every power node should have an individual persistent record.
+3. Network power totals should never be persisted. They should be reconstructed on startup.
+4. Network membership should be recoverable from persistent node and topology data.
+5. Activity and power contribution should be coupled.
+6. Temporary activity should expire automatically without scanning every node.
+7. Unloaded nodes must not automatically be considered deleted.
+8. Saving one changed node must not require serializing an entire network.
+9. Network merging and splitting should avoid unnecessary persistent writes.
+10. Loading can be computationally expensive, provided it reconstructs the correct runtime state.
+
+# 2. Persistent node records
+
+Replace the separate node supply and demand tables with a unified node-record system.
+
+Every registered power node should have an individual record containing:
+
+- Its network ID.
+- Its supply contribution.
+- Its demand contribution.
+- Its optional activity expiration timestamp.
+
+The record is the authoritative source of information about that node.
+
+### Activity representation
+
+There are two possible activity states:
+
+- Permanent activity: No expiration timestamp. The node contributes power indefinitely, including while unloaded.
+- Temporary activity: An expiration timestamp. The node contributes power until that timestamp is reached.
+
+An expired temporary node contributes neither supply nor demand.
+
+Activity timestamps should be persisted. This ensures temporary leases behave consistently across server restarts.
+
+A server restart must not accidentally reactivate expired machines.
+
+### Individual storage records
+
+Each node should have its own storage key, identified by its position hash.
+
+This allows the system to:
+
+- Save individual nodes.
+- Delete individual node records.
+- Update node data without serializing unrelated records.
+- Avoid full-table serialization during ordinary saving.
+
+The node hash should be the persistent identifier.
+
+# 3. Network metadata and topology
+
+Network metadata should be stored separately from node records.
+
+Network metadata should contain only information that cannot conveniently be reconstructed from node records, such as:
+
+- Network ID.
+- Network type.
+- Any additional persistent network configuration.
+- The next network ID counter.
+
+Network supply and demand should not be saved.
+
+### Network membership
+
+There are two related approaches to membership persistence that should be considered:
+
+Canonical membership records
+
+Each node record stores its current network ID.
+
+Topology-change records
+
+Network merging and splitting can produce separate records describing which nodes need to move between networks.
+
+The intention is to avoid rewriting thousands of individual node records whenever a large network splits or merges.
+
+Topology-change records should act as an overlay on the canonical node records.
+
+Important requirements:
+
+- Topology changes must be applied in the correct order.
+- A node must never end up belonging to two networks.
+- Network deletion must be handled correctly.
+- Old topology records must eventually be compacted into canonical node records.
+- Loading must reconstruct the final membership correctly.
+
+Do not allow topology-change records to accumulate indefinitely.
+
+A practical approach is to use periodic compaction, where the current final network membership is written back into canonical node records and obsolete topology records are removed.
+
+# 4. Runtime-only data
+
+The following structures should exist only in memory:
+
+| Structure | Responsibility |
+| --- | --- |
+| Networks | Network objects and current power totals |
+| Network nodes | Node membership indexes |
+| Position-to-network | Fast hash-to-network lookup |
+| Expiration queue | Scheduled temporary activity expiration |
+| Dirty node queue | Tracks modified node records |
+| Dirty topology queue | Tracks membership changes |
+| Dirty network queue | Tracks modified network metadata |
+
+All runtime structures must be reconstructible during startup.
+
+Avoid persisting redundant information simply because it makes runtime operations easier.
+
+# 5. Power accounting
+
+Network supply and demand should represent the sum of the contributions of currently active nodes.
+
+For example:
+
+A network contains:
+
+- Generator A: 100 supply, permanently active.
+- Generator B: 50 supply, temporarily active.
+- Machine A: 30 demand, permanently active.
+- Machine B: 20 demand, temporarily active.
+
+If Generator B and Machine B expire, the network should automatically become:
+
+- Supply: 100.
+- Demand: 30.
+
+There should be no separate concept of total power versus active power.
+
+The network's stored runtime totals are always its currently usable power.
+
+### Centralize power updates
+
+The public `set_node_power` function should be responsible for:
+
+1. Retrieving the node's previous record.
+2. Determining its previous active contribution.
+3. Updating supply and demand.
+4. Updating its activity expiration.
+5. Determining its new active contribution.
+6. Calculating the difference between old and new contributions.
+7. Updating its network's totals.
+8. Scheduling its expiration when necessary.
+9. Marking persistent data dirty when persistent information has changed.
+
+Other functions should not manually implement their own node power accounting.
+
+This is important for avoiding inconsistent totals.
+
+### Inactive node updates
+
+Changing the supply or demand of an inactive node should update its persistent record without affecting network totals.
+
+When that node becomes active again, its latest values should be used.
+
+# 6. Activity expiration system
+
+Do not scan every node record every second.
+
+Instead, implement a time-bucket expiration queue.
+
+Use `core.get_us_time()` as the time source.
+
+### How it should work
+
+1. When a node receives a temporary activity duration, calculate its expiration timestamp.
+2. Determine which time bucket contains that timestamp.
+3. Insert the node hash into that bucket.
+4. During globalsteps, determine which time buckets have elapsed.
+5. Process only those buckets.
+6. For each entry, check whether its timestamp still matches the node's current expiration.
+7. If it matches, deactivate the node and subtract its contribution from its network.
+8. If it does not match, discard the stale queue entry.
+
+### Lease refreshes
+
+A node may refresh its activity before its previous lease expires.
+
+For example:
+
+- A node requests a 10-second lease.
+- Five seconds later, it requests another 10-second lease.
+- Its original expiration entry is still in the queue.
+
+The old entry must not deactivate the node.
+
+Use timestamp validation to distinguish current entries from stale entries.
+
+### Permanent activity
+
+Nodes without an expiration timestamp are permanently active.
+
+They should never be inserted into the expiration queue.
+
+### Startup reconstruction
+
+The expiration queue should not be saved.
+
+During startup, reconstruct it from temporary node records.
+
+Expired records should contribute no power.
+
+### Future optimization
+
+A hierarchical timing wheel could be considered if the number of temporary nodes becomes exceptionally large or lease durations become very long.
+
+For now, a simple time-bucket system is sufficient.
+
+# 7. Node loading and unloading
+
+The network system must distinguish between a node being unloaded and a node being deleted.
+
+These are not the same thing.
+
+An unloaded node retains its persistent record and network membership.
+
+### Activity model
+
+Nodes themselves report their activity through `set_node_power`.
+
+They provide an optional duration indicating how long their contribution should remain active.
+
+This creates a lease-based activity system.
+
+Examples:
+
+- Passive generator: Permanent activity, no duration.
+- Machine requiring world interaction: Short temporary lease.
+- Machine that periodically performs work: Refreshes its lease while loaded.
+
+When a temporary lease expires, its contribution disappears.
+
+There is no need for a separate loaded-node table.
+
+There is also no need for reliable unload callbacks.
+
+### Important distinction
+
+A passive generator can continue contributing power while unloaded.
+
+An involved machine can stop contributing when unloaded because it stops refreshing its lease.
+
+LBMs can help reconcile existing nodes when mapblocks load, but should not be treated as authoritative unload notifications.
+
+Node timers are not necessary for the basic activity system.
+
+# 8. Network operations
+
+The existing network topology algorithms should initially be retained.
+
+There is no need to rewrite everything simultaneously.
+
+However, their interaction with node records must change.
+
+### Adding nodes
+
+When a node is added:
+
+- Create its persistent record.
+- Assign its network ID.
+- Add it to runtime membership indexes.
+- Apply its active power contribution.
+- Mark relevant persistent data dirty.
+
+### Removing nodes
+
+When a node is removed:
+
+- Subtract its active contribution.
+- Remove its persistent record.
+- Remove its runtime membership.
+- Mark its deletion for saving.
+- Handle possible network splitting.
+
+Never confuse an unloaded node with a removed node.
+
+### Merging networks
+
+When networks merge:
+
+- Combine their runtime power totals.
+- Move their runtime membership.
+- Update position-to-network mappings.
+- Record the topology change.
+- Avoid unnecessarily rewriting every node's persistent record immediately.
+
+Consider smaller-to-larger merging to reduce the number of membership operations.
+
+### Splitting networks
+
+Retain the existing connected-component algorithm initially.
+
+When a network splits:
+
+- Discover its connected components.
+- Create the resulting networks.
+- Reassign runtime membership.
+- Recalculate each resulting network's power from its active node contributions.
+- Record the necessary topology changes.
+
+Network splitting is less performance-critical than ordinary saving, so correctness should take priority over optimizing it prematurely.
+
+# 9. Saving architecture
+
+This is the most important performance consideration.
+
+Saving should scale with the number of changed records, not the total number of nodes in the world.
+
+### Dirty queues
+
+Maintain separate dirty queues for:
+
+- Node records.
+- Topology changes.
+- Network metadata.
+
+Whenever persistent information changes, mark the relevant record dirty.
+
+Repeated changes to the same node should overwrite its dirty entry rather than create duplicate entries.
+
+### Periodic saving
+
+The globalstep should periodically process dirty records.
+
+It should:
+
+- Save only modified records.
+- Process records in manageable batches.
+- Avoid serializing entire tables.
+- Avoid unnecessary writes.
+- Remove successfully processed records from dirty queues.
+
+The batch size should be configurable and adjusted through profiling.
+
+### Power changes versus persistent changes
+
+An important optimization:
+
+Ordinary changes to network power totals do not necessarily require persistent writes.
+
+For example, an inactive machine becoming active changes runtime power totals and activity state.
+
+However, the network's total supply and demand are not themselves persisted.
+
+Similarly, a generator changing its output only needs its individual node record saved.
+
+### Shutdown saving
+
+The shutdown callback should flush remaining dirty records.
+
+It should not depend on the periodic saving process having completed.
+
+# 10. Startup and reconstruction
+
+Loading can be expensive, so prioritize correctness.
+
+The startup process should:
+
+1. Read network metadata.
+2. Read all canonical node records.
+3. Read topology-change records.
+4. Apply topology changes in the correct order.
+5. Reconstruct network membership.
+6. Reconstruct the position-to-network lookup.
+7. Reconstruct network node indexes.
+8. Initialize network power totals.
+9. Sum contributions from permanently active nodes.
+10. Sum contributions from temporary nodes whose expiration timestamps are still valid.
+11. Rebuild the expiration queue.
+12. Begin normal operation.
+
+At the end of loading, runtime data should be internally consistent.
+
+# 11. Recommended implementation order
+
+Do not implement everything simultaneously.
+
+Use this sequence:
+
+1. Create the new node-record system.
+   Replace the separate supply and demand tables. Implement individual node storage records and test saving, loading, and deletion.
+2. Separate persistent and runtime data.
+   Establish which tables are saved and which are reconstructed.
+3. Rewrite power accounting.
+   Make `set_node_power` the central authority for node contributions and activity.
+4. Implement expiration buckets.
+   Add temporary activity leases and automatic expiration.
+5. Adapt node addition and removal.
+   Ensure records and runtime indexes remain synchronized.
+6. Adapt merging and splitting.
+   Preserve the existing topology algorithms where possible.
+7. Implement topology persistence.
+   Introduce membership-change records and compaction.
+8. Implement dirty-record saving.
+   Add batched writes and shutdown flushing.
+9. Implement full startup reconstruction.
+   Test with large networks and many node records.
+10. Migrate existing worlds.
+    Add compatibility loading for the old storage format, verify migration, and eventually remove the old format.
+
+# 12. Testing requirements
+
+Test each stage before moving on.
+
+Particularly important cases:
+
+| Test | Expected result |
+| --- | --- |
+| Add a node | Correct network membership and power |
+| Remove a node | Correct power subtraction |
+| Change generator output | Only the correct power difference is applied |
+| Update an inactive node | Network totals remain unchanged |
+| Refresh an activity lease | Old expiration cannot deactivate it |
+| Expire an activity lease | Its contribution is removed exactly once |
+| Restart with permanent nodes | Their contributions are reconstructed |
+| Restart with valid temporary leases | Their contributions are reconstructed |
+| Restart with expired leases | They remain inactive |
+| Merge two networks | Membership and power remain correct |
+| Split a network | Each component gets correct totals |
+| Unload a mapblock | Nodes are not deleted |
+| Save one changed node | Unrelated records are untouched |
+| Delete a node | Its persistent record is eventually removed |
+| Interrupt periodic saving | Shutdown flushes remaining dirty data |
+
+Also test migration from an existing world, preferably using a backup.
+
+# 13. Things explicitly not to optimize yet
+
+Avoid premature complexity.
+
+For now, do not:
+
+- Implement a hierarchical timing wheel.
+- Rewrite the connected-component algorithm.
+- Introduce complicated asynchronous saving.
+- Optimize every table lookup.
+- Build a sophisticated mapblock tracking system.
+- Persist redundant runtime information.
+- Make machines simulate while unloaded unless their behavior specifically requires it.
+
+First establish correctness and measure actual performance.
+
+# Final architectural summary
+
+## Persistent storage
+
+Individual node records
+
+Network ID, supply, demand, activity expiration.
+
+Topology records
+
+Network membership changes, merges, splits, and compaction.
+
+Network metadata
+
+Network IDs, types, and ID counter.
+
+## Runtime system
+
+Network caches
+
+Membership indexes, position lookup, supply, and demand.
+
+Activity expiration queue
+
+Time buckets containing nodes scheduled for expiration.
+
+Dirty queues
+
+Track records that need writing.
+
+Saving: Only changed records.
+
+Loading: Reconstruct everything.
+
+## The single most important rule
+
+Persistent data describes what exists. Runtime data describes what is currently happening.
+
+A node record tells us what a node contributes and which network it belongs to. Its activity timestamp tells us whether that contribution currently counts. Network totals and lookup tables are merely convenient runtime representations that can be rebuilt whenever necessary.
+
+Keep that distinction intact throughout implementation, and the architecture should remain manageable even as the number of nodes and networks grows.
